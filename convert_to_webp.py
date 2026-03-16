@@ -4,6 +4,7 @@ import time
 import json
 import argparse
 import logging
+import shutil
 from pathlib import Path
 from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,25 +13,33 @@ from PIL import Image, ImageFile, ImageCms, features
 
 # Allow truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None
 
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif"}
 
 LOSSLESS_FORMATS = {".png", ".bmp", ".tiff", ".tif", ".gif"}
 LOSSY_FORMATS = {".jpg", ".jpeg"}
 
-Image.MAX_IMAGE_PIXELS = None
+# ───────────── Logging Setup ─────────────
 
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
 
-# ───────────── Logging ─────────────
+log_file = log_dir / f"compression_{int(time.time())}.log"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
 )
 
 logger = logging.getLogger(__name__)
 
-
 # ───────────── Utilities ─────────────
+
 def human_size(n_bytes: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n_bytes < 1024:
@@ -39,120 +48,119 @@ def human_size(n_bytes: int) -> str:
     return f"{n_bytes:.1f} TB"
 
 
+def clean_filename(name: str) -> str:
+    name = name.replace(" ", "_")
+    return name[:30]
+
+
 def collect_images(root: Path) -> List[Path]:
+
     images = []
+
     for dirpath, _, filenames in os.walk(root):
+
         for fn in filenames:
+
             if Path(fn).suffix.lower() in SUPPORTED:
                 images.append(Path(dirpath) / fn)
+
     return sorted(images)
 
 
-def output_path(src: Path, input_root: Path, output_root: Path, flat: bool) -> Path:
-    if flat:
-        return output_root / (src.stem + ".webp")
+def output_path(src: Path, input_root: Path, output_root: Path) -> Path:
 
     rel = src.relative_to(input_root)
-    return output_root / rel.parent / (src.stem + ".webp")
+
+    clean_name = clean_filename(src.stem)
+
+    return output_root / rel.parent / (clean_name + ".webp")
 
 
 def get_compression_mode(src: Path):
+
     ext = src.suffix.lower()
+
     if ext in LOSSY_FORMATS:
         return False, "lossy"
+
     return True, "lossless"
 
 
-# ───────────── Verify Image ─────────────
-def verify_image(src: Path) -> Dict:
+# ───────────── Archive Original Images ─────────────
 
-    result = {
-        "src": str(src),
-        "valid": False,
-        "error": None
-    }
+def archive_images(images: List[Path], archive_dir: Path):
 
-    try:
-        with Image.open(src) as img:
-            img.verify()
+    archive_dir.mkdir(parents=True, exist_ok=True)
 
-        result["valid"] = True
+    for img in images:
 
-    except Exception as e:
-        result["error"] = str(e)
+        try:
+            shutil.copy2(img, archive_dir / img.name)
 
-    return result
+        except Exception as e:
+            logger.warning(f"Archive failed for {img}: {e}")
 
 
 # ───────────── Image Conversion ─────────────
+
 def convert_image(
         src: Path,
         dst: Path,
         quality: int,
         method: int,
-        overwrite: bool,
-        max_size: int = None,
+        overwrite: bool
 ) -> Dict:
 
     lossless, mode_label = get_compression_mode(src)
 
     result = {
-        "src": str(src),
-        "dst": str(dst),
-        "success": False,
-        "skipped": False,
-        "mode": mode_label,
+        "file_name": src.name,
+        "file_type": src.suffix,
+        "compression_status": False,
         "src_size": src.stat().st_size,
         "dst_size": 0,
+        "size_reduced": 0,
+        "resolution_after": None,
         "error": None
     }
 
     if dst.exists() and not overwrite:
-        result["skipped"] = True
-        result["dst_size"] = dst.stat().st_size
         return result
 
     try:
+
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         with Image.open(src) as img:
 
-            # ── METADATA LOGGING ──
             logger.info(
                 f"Processing {src.name} | "
                 f"{img.width}x{img.height} | "
-                f"{img.mode} | "
                 f"{human_size(src.stat().st_size)}"
             )
 
-            MAX_PIXELS = 100_000_000
-            if img.width * img.height > MAX_PIXELS:
-                logger.warning(f"Large image detected: {src.name}")
-                img.thumbnail((8000, 8000), Image.LANCZOS)
-
-            # Color mode conversion
+            # Color conversion
             if img.mode in ("RGBA", "LA", "P"):
                 img = img.convert("RGBA")
             elif img.mode != "RGB":
                 img = img.convert("RGB")
 
-            # ICC → sRGB conversion
+            # Convert ICC profile
             try:
                 if "icc_profile" in img.info:
-                    srgb_profile = ImageCms.createProfile("sRGB")
+
+                    srgb = ImageCms.createProfile("sRGB")
+
                     img = ImageCms.profileToProfile(
                         img,
                         img.info.get("icc_profile"),
-                        srgb_profile
+                        srgb
                     )
+
             except Exception:
                 pass
 
             img.info.pop("icc_profile", None)
-
-            # Resize if required
-            if max_size:
-                img.thumbnail((max_size, max_size), Image.LANCZOS)
 
             save_kwargs = {
                 "format": "WEBP",
@@ -166,24 +174,21 @@ def convert_image(
             img.save(dst, **save_kwargs)
 
         result["dst_size"] = dst.stat().st_size
-        result["success"] = True
+        result["size_reduced"] = result["src_size"] - result["dst_size"]
+        result["compression_status"] = True
 
-    except MemoryError:
-        result["error"] = "MemoryError: image too large"
+        with Image.open(dst) as im:
+            result["resolution_after"] = f"{im.width}x{im.height}"
 
-    except OSError as e:
-        result["error"] = f"OSError: {e}"
+    except Exception as e:
 
-    except Image.DecompressionBombError as e:
-        result["error"] = f"DecompressionBombError: {e}"
-
-    except ValueError as e:
-        result["error"] = f"ValueError: {e}"
+        result["error"] = str(e)
 
     return result
 
 
 # ───────────── Runner ─────────────
+
 def run_conversion(
         images: List[Path],
         input_root: Path,
@@ -191,14 +196,12 @@ def run_conversion(
         quality: int,
         method: int,
         overwrite: bool,
-        flat: bool,
-        max_size: int,
-        workers: int,
-        verify_only: bool
+        workers: int
 ):
 
-    start = time.time()
     results = []
+
+    start = time.time()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
 
@@ -206,25 +209,21 @@ def run_conversion(
 
         for src in images:
 
-            if verify_only:
-                futures.append(executor.submit(verify_image, src))
+            dst = output_path(src, input_root, output_root)
 
-            else:
-                dst = output_path(src, input_root, output_root, flat)
-
-                futures.append(
-                    executor.submit(
-                        convert_image,
-                        src,
-                        dst,
-                        quality,
-                        method,
-                        overwrite,
-                        max_size
-                    )
+            futures.append(
+                executor.submit(
+                    convert_image,
+                    src,
+                    dst,
+                    quality,
+                    method,
+                    overwrite
                 )
+            )
 
         for future in as_completed(futures):
+
             results.append(future.result())
 
     elapsed = time.time() - start
@@ -234,39 +233,57 @@ def run_conversion(
     return results
 
 
-# ───────────── CLI ─────────────
+# ───────────── Generate Final Report ─────────────
+
+def generate_report(results: List[Dict], report_path: Path):
+
+    report = []
+
+    for r in results:
+
+        report.append({
+            "file_name": r["file_name"],
+            "file_type": r["file_type"],
+            "compression_status": r["compression_status"],
+            "size_reduced_bytes": r["size_reduced"],
+            "resolution_after_compression": r["resolution_after"]
+        })
+
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    logger.info(f"Final report saved to {report_path}")
+
+
+# ───────────── CLI Arguments ─────────────
+
 def parse_args():
 
-    p = argparse.ArgumentParser(
-        description="Batch convert images to WebP"
+    parser = argparse.ArgumentParser(
+        description="Batch Image Compression Tool"
     )
 
-    p.add_argument("--input", required=True)
-    p.add_argument("--output", default=None)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", default="compressed_images")
 
-    p.add_argument("--quality", type=int, default=85)
-    p.add_argument("--method", type=int, default=6)
+    parser.add_argument("--quality", type=int, default=85)
+    parser.add_argument("--method", type=int, default=6)
 
-    p.add_argument("--max-size", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=4)
 
-    p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--flat", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
 
-    p.add_argument("--workers", type=int, default=4)
-
-    p.add_argument("--report", help="Save JSON report")
-
-    # NEW FEATURE
-    p.add_argument("--verify-only", action="store_true")
-
-    return p.parse_args()
+    return parser.parse_args()
 
 
 # ───────────── Main ─────────────
+
 def main():
 
     if not features.check("webp"):
-        logger.error("Your Pillow installation does not support WebP.")
+
+        logger.error("Pillow installation does not support WebP")
+
         sys.exit(1)
 
     args = parse_args()
@@ -274,22 +291,31 @@ def main():
     input_root = Path(args.input).resolve()
 
     if not input_root.exists():
-        logger.error(f"Input path does not exist: {input_root}")
+
+        logger.error("Input path does not exist")
+
         sys.exit(1)
 
-    if args.output:
-        output_root = Path(args.output).resolve()
-    else:
-        output_root = input_root.parent / (input_root.name + "_webp_output")
+    output_root = Path(args.output).resolve()
 
     images = collect_images(input_root)
 
     if not images:
-        logger.warning("No supported images found.")
+
+        logger.warning("No images found")
+
         return
 
     logger.info(f"Found {len(images)} images")
 
+    # Archive originals
+    archive_dir = output_root / "archive"
+
+    archive_images(images, archive_dir)
+
+    logger.info("Original images archived")
+
+    # Convert images
     results = run_conversion(
         images,
         input_root,
@@ -297,17 +323,13 @@ def main():
         args.quality,
         args.method,
         args.overwrite,
-        args.flat,
-        args.max_size,
-        args.workers,
-        args.verify_only
+        args.workers
     )
 
-    if args.report:
-        with open(args.report, "w") as f:
-            json.dump(results, f, indent=2)
+    # Generate final report
+    report_path = Path("final_report.json")
 
-        logger.info(f"Report saved to {args.report}")
+    generate_report(results, report_path)
 
 
 if __name__ == "__main__":
